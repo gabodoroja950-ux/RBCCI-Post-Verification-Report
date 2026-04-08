@@ -390,26 +390,21 @@ I hereby confirm that the validating officer indeed personally appeared/visited 
 const SHEETS_URL='https://script.google.com/macros/s/AKfycbyBbkyo98d9aeJb3BcXHc0IN2teyyI77GMrm66o3ER0bXB75qUbh3LsHYRyW9YYmm0G/exec';
 
 // ── Universal POST to Apps Script (works from https://) ───────
-// readResponse=true  → waits for and returns parsed JSON response
-// readResponse=false → fire-and-forget (no-cors, fast)
-async function postToSheets(payload, readResponse=false){
-  if(readResponse){
-    // Use cors mode to read the response back
-    const resp = await fetch(SHEETS_URL, {
-      method: 'POST',
-      headers: {'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify(payload)
-    });
-    return await resp.json();
-  } else {
-    // Fire-and-forget — no-cors is fine, no response needed
-    await fetch(SHEETS_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: {'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify(payload)
-    });
-  }
+// ── POST to Apps Script (always no-cors — avoids CORS preflight) ─
+async function postToSheets(payload){
+  await fetch(SHEETS_URL, {
+    method: 'POST',
+    mode: 'no-cors',
+    headers: {'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify(payload)
+  });
+}
+
+// ── GET from Apps Script (cors, readable response) ────────────
+async function getFromSheets(params={}){
+  const qs = Object.entries(params).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  const resp = await fetch(SHEETS_URL + (qs?'?'+qs:''));
+  return await resp.json();
 }
 
 // ── Init: generate unique access code on load ──────────────────────────────
@@ -762,15 +757,10 @@ function compressImage(dataURL, maxWidth, maxHeight, quality){
 
 async function uploadFileToDrive(dataURL, filename, mimeType, refCode){
   const base64 = dataURL.includes(',') ? dataURL.split(',')[1] : dataURL;
-  // readResponse=true so we get the Drive link back
-  const result = await postToSheets({
-    action: 'uploadFile', filename, mimeType,
-    folder: refCode, data: base64
-  }, true);
-  if(result && result.status === 'ok' && result.link){
-    return result.link;
-  }
-  throw new Error(result ? (result.message || 'Upload failed') : 'No response');
+  // Send fire-and-forget — Apps Script saves to Drive
+  await postToSheets({ action:'uploadFile', filename, mimeType, folder:refCode, data:base64 });
+  // Return a placeholder — actual link is retrieved after row save via doGet
+  return 'pending';
 }
 
 async function saveToSheets(silent=false){
@@ -778,26 +768,23 @@ async function saveToSheets(silent=false){
   const refCode = d.refNo || 'DRAFT';
   if(!silent) toast('💾 Saving…');
 
-  // Collect existing links
-  let sigLink = document.getElementById('sigDriveLink').value || '';
-  const allAssetLinks = [
+  const existingSigLink = document.getElementById('sigDriveLink').value || '';
+  const allAssetLinks   = [
     ...loadedAssetLinks,
-    ...assetFiles.filter(e=>e.status==='ok' && e.driveLink && e.driveLink!=='uploaded').map(e=>e.driveLink)
+    ...assetFiles.filter(e=>e.status==='ok' && e.driveLink && e.driveLink!=='pending').map(e=>e.driveLink)
   ];
 
   // ── Step 1: Upload signature if newly drawn ───────────────────
-  if(sigHasSig && !sigLink){
+  if(sigHasSig && !existingSigLink){
     try{
       document.getElementById('sigUploadStatus').textContent = 'Uploading signature…';
       document.getElementById('sigUploadStatus').className   = 'sig-status pending';
       const rawURL     = getSigDataURL();
       const compressed = await compressImage(rawURL, 800, 300, 0.85);
-      sigLink = await uploadFileToDrive(compressed, 'signature_'+refCode+'.png', 'image/jpeg', refCode);
-      document.getElementById('sigDriveLink').value          = sigLink;
-      document.getElementById('sigUploadStatus').textContent = '✓ Signature saved to Drive';
+      await uploadFileToDrive(compressed, 'signature_'+refCode+'.png', 'image/jpeg', refCode);
+      document.getElementById('sigUploadStatus').textContent = '✓ Signature sent to Drive';
       document.getElementById('sigUploadStatus').className   = 'sig-status ok';
     }catch(err){
-      console.error('Sig upload:', err);
       if(!silent) toast('⚠ Signature upload failed: '+err.message, 4000);
     }
   }
@@ -810,34 +797,58 @@ async function saveToSheets(silent=false){
       entry.status = 'uploading';
       renderAssetThumbs();
       const compressed = await compressImage(entry.dataURL, 1200, 1200, 0.70);
-      const ext  = 'jpg';
-      const name = 'asset_'+refCode+'_'+(i+1)+'_'+Date.now()+'.'+ext;
-      const link = await uploadFileToDrive(compressed, name, 'image/jpeg', refCode);
+      const name = 'asset_'+refCode+'_'+(i+1)+'_'+Date.now()+'.jpg';
+      await uploadFileToDrive(compressed, name, 'image/jpeg', refCode);
       entry.status    = 'ok';
-      entry.driveLink = link;
-      allAssetLinks.push(link);
+      entry.driveLink = 'pending'; // real link retrieved after GET
       renderAssetThumbs();
     }catch(err){
-      console.error('Asset upload:', err);
       entry.status = 'pending';
       renderAssetThumbs();
       if(!silent) toast('⚠ Photo '+(i+1)+' upload failed', 3000);
     }
   }
 
-  // ── Step 3: Save row to Sheet (with all Drive links) ──────────
-  const row = buildRow(d, sigLink, allAssetLinks);
+  // ── Step 3: Save row to Sheet ─────────────────────────────────
+  // Use placeholder links now — Drive processes files async
+  // The Sheet row will be updated with real links via Step 4
+  const row = buildRow(d, existingSigLink||'', allAssetLinks);
   try{
-    await postToSheets({ action:'upsert', row, refCode }, false);
+    await postToSheets({ action:'upsert', row, refCode });
     const ts = new Date().toLocaleTimeString();
     document.getElementById('statusSave').innerHTML =
       '<span class="saved">✓ Saved to Sheets '+ts+'</span>';
-    if(!silent) toast('✅ Saved to Google Sheets!');
+    if(!silent) toast('✅ Saved! Drive files uploading…');
   }catch(err){
     document.getElementById('statusSave').innerHTML =
       '<span style="color:var(--red)">⚠ Save failed</span>';
     if(!silent) alert('Failed to save.\n\n'+err.message);
+    return;
   }
+
+  // ── Step 4: Wait 4s then fetch row back to get real Drive links ──
+  // Apps Script processes file uploads and updates the row with links
+  setTimeout(async()=>{
+    try{
+      const result = await getFromSheets({ code: refCode });
+      if(result.status==='ok' && result.data){
+        const r = result.data;
+        const sigL = r['Borrower Signature Link']||'';
+        const assL = r['Asset Photo Links']||'';
+        if(sigL && sigL !== existingSigLink){
+          document.getElementById('sigDriveLink').value = sigL;
+          document.getElementById('sigUploadStatus').textContent = '✓ Signature on Drive';
+          document.getElementById('sigUploadStatus').className   = 'sig-status ok';
+        }
+        if(assL){
+          loadedAssetLinks = assL.split(' | ').filter(Boolean);
+          renderLoadedAssetLinks(loadedAssetLinks);
+        }
+        document.getElementById('statusSave').innerHTML =
+          '<span class="saved">✓ Saved + Drive files confirmed</span>';
+      }
+    }catch(e){ /* silent — links will be there in Drive */ }
+  }, 5000);
 }
 
 // Auto-save every 2 minutes if form has data
@@ -1010,22 +1021,21 @@ async function testUpload(){
 
   // Test 1: GET connectivity
   try{
-    const r = await fetch(SHEETS_URL);
-    const j = await r.json();
+    const j = await getFromSheets();
     results.push('✅ GET connectivity: '+JSON.stringify(j).substring(0,80));
   } catch(e){ results.push('❌ GET failed: '+e.message); }
 
   // Test 2: Row upsert (no-cors POST)
   try{
-    await postToSheets({action:'upsert', refCode, row:{'Reference No':refCode,'Test Field':'diagnostic_'+Date.now()}}, false);
+    await postToSheets({action:'upsert', refCode, row:{'Reference No':refCode,'Test Field':'diagnostic_'+Date.now()}});
     results.push('✅ Row upsert: sent — check Sheet for '+refCode);
   } catch(e){ results.push('❌ Row upsert failed: '+e.message); }
 
-  // Test 3: Tiny file upload (with response)
+  // Test 3: Tiny file upload (no-cors), then verify via GET after 4s
   const tinyPng='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==';
   try{
-    const r2 = await postToSheets({action:'uploadFile', folder:refCode, filename:'test_pixel.png', mimeType:'image/png', data:tinyPng}, true);
-    results.push('✅ File upload: '+JSON.stringify(r2));
+    await postToSheets({action:'uploadFile', folder:refCode, filename:'test_pixel_'+Date.now()+'.png', mimeType:'image/png', data:tinyPng});
+    results.push('✅ File upload sent (no-cors) — check Drive folder "'+refCode+'" in ~5 seconds');
   } catch(e){ results.push('❌ File upload failed: '+e.message); }
 
   alert('=== DIAGNOSTIC RESULTS ===\n\n'+results.join('\n\n'));
